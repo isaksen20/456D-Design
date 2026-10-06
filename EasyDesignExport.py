@@ -22,9 +22,27 @@ def solid_shape(obj):
         raise ValueError("Select a solid to export.")
     from EasyDesignMM import _shape
     shape = _shape(obj).copy()
-    if shape.isNull() or not shape.Solids or not shape.isValid():
+    if shape.isNull() or not shape.Solids:
         raise ValueError("Export needs a valid solid.")
+    if not shape.isValid():
+        shape = _repair_export_shape(shape)
     return shape
+
+
+def _repair_export_shape(shape):
+    # Saved booleans can retain misoriented wires. Heal only an export copy;
+    # a repair that changes material or the envelope must not be accepted.
+    fixed = shape.copy()
+    fixed.fix(1e-7, 1e-7, 1e-4)
+    if (fixed.isNull() or not fixed.isValid()
+            or len(fixed.Solids) != len(shape.Solids)
+            or len(fixed.Faces) != len(shape.Faces)
+            or abs(fixed.Volume - shape.Volume) > max(1e-7, abs(shape.Volume) * 1e-8)
+            or abs(fixed.Area - shape.Area) > max(1e-7, shape.Area * 1e-8)
+            or any(abs(getattr(fixed.BoundBox, axis) - getattr(shape.BoundBox, axis)) > 1e-6
+                   for axis in ("XMin", "XMax", "YMin", "YMax", "ZMin", "ZMax"))):
+        raise ValueError("Export needs a valid solid. This shape could not be repaired without changing its geometry.")
+    return fixed
 
 
 def export_selected(obj, filename):
@@ -42,6 +60,8 @@ def export_selected(obj, filename):
                                           AngularDeflection=.25, Relative=False)
             if mesh.CountFacets == 0:
                 raise ValueError("The solid could not be meshed for STL export.")
+            if not mesh.isSolid():
+                raise ValueError("The STL mesh is not closed. Repair the solid before exporting.")
             mesh.write(str(temporary))
         else:
             shape.exportStep(str(temporary))
