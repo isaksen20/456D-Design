@@ -223,11 +223,15 @@ def text_solid(profile, distance):
 
 
 class TextExtrusion:
+    def onDocumentRestored(self, obj):
+        if obj.Target and obj.Target.isDerivedFrom("PartDesign::Body") and obj.Target.Tip:
+            obj.Target = obj.Target.Tip
+
     def execute(self, obj):
         import EasyDesignMM as mm
         if obj.Profile is None:
             raise ValueError("The text profile is missing.")
-        key = (obj.Profile.Shape.hashCode(), obj.Depth)
+        key = (obj.Profile.Shape.hashCode(), tuple(obj.Profile.getGlobalPlacement().toMatrix().A), obj.Depth)
         cached = getattr(self, "_cached_tool", None)
         if cached is None or cached[0] != key:
             cached = self._cached_tool = (key, text_solid(obj.Profile, obj.Depth))
@@ -310,7 +314,7 @@ class TextPullPreview:
     def _build(self, distance):
         import EasyDesignMM as mm
         tool = text_solid(self.sketch, distance)
-        self.feature.Proxy._cached_tool = ((self.sketch.Shape.hashCode(), distance), tool)
+        self.feature.Proxy._cached_tool = ((self.sketch.Shape.hashCode(), tuple(self.sketch.getGlobalPlacement().toMatrix().A), distance), tool)
         preferred = mm.solid_object(self.sketch.WrapTarget or self.sketch.SupportSolid) if (self.sketch.WrapTarget or self.sketch.SupportSolid) else None
         candidates = sorted(self.candidates, key=lambda obj: obj != preferred)
         target = None
@@ -326,7 +330,9 @@ class TextPullPreview:
             actual = ("Subtract / Cut" if distance < 0 else "Merge") if target else "New Solid"
         if actual != "New Solid" and target is None:
             raise ValueError("The text must touch a solid for Merge or enter it for Cut.")
-        self.feature.Target = target if actual != "New Solid" else None
+        # A Body's Tip can change later. Keep this operation linked to the
+        # feature it actually used, not to the body's evolving final result.
+        self.feature.Target = (target.Tip if target and target.isDerivedFrom("PartDesign::Body") else target) if actual != "New Solid" else None
         self.feature.Operation, self.feature.Depth = actual, distance
         try:
             self.feature.Proxy.execute(self.feature)

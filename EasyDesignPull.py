@@ -4,6 +4,7 @@ import math
 import FreeCADGui as Gui
 import FreeCAD as App
 import Part
+import EasyDesignMM as mm
 
 
 OPERATIONS = ("Auto", "New Solid", "Merge", "Subtract / Cut")
@@ -80,8 +81,14 @@ class PullPreview:
         if not multiple and (not body or not body.isDerivedFrom("PartDesign::Body")):
             raise ValueError("The sketch must be inside a Part Design body.")
         self.previous_solid = _previous_solid(body, sketch) if body else None
+        self.native_solid = self.previous_solid
+        self.candidates = [obj for obj in sketch.Document.Objects
+                           if hasattr(obj, "Shape") and not obj.Shape.isNull() and obj.Shape.Solids
+                           and mm.solid_object(obj) == obj and not obj.isDerivedFrom("App::Part")
+                           and (not obj.ViewObject or mm._visible(obj))
+                           and obj != body]
         self.standalone_body = body is None
-        if cut and not new_solid and self.previous_solid is None:
+        if cut and not new_solid and self.previous_solid is None and not self.candidates:
             raise ValueError("Cut needs an existing solid. Pull a profile first.")
         if Gui.Control.activeDialog():
             raise ValueError("Close the current task before pulling the sketch.")
@@ -109,11 +116,14 @@ class PullPreview:
         self.body = body
         self.cut = cut
         self.feature = None
+        self.reference = None
         self.view_provider = sketch.ViewObject
         self.original_visibility = self.view_provider.Visibility if self.view_provider else None
         self.active = False
+        original_objects = [body, self.previous_solid] + self.source_sketches + self.candidates
+        original_objects += [obj.Tip for obj in self.candidates if obj.isDerivedFrom("PartDesign::Body") and obj.Tip]
         self.original_views = [(obj.ViewObject, obj.ViewObject.Visibility)
-                               for obj in [body, self.previous_solid] + self.source_sketches
+                               for obj in original_objects
                                if obj and obj.ViewObject]
         self.doc.openTransaction("Cut profile" if cut else "Pull profile")
         try:
@@ -140,6 +150,9 @@ class PullPreview:
         self.sketch = self.source_sketch
         if self.body != self.source_body and self.doc.getObject(self.body.Name):
             self.doc.removeObject(self.body.Name)
+        if self.reference and self.doc.getObject(self.reference.Name):
+            self.doc.removeObject(self.reference.Name)
+        self.reference = None
         self.body = self.source_body
         self.body.Tip = self.original_tip
         self._restore_visibility()
@@ -148,7 +161,7 @@ class PullPreview:
         if len(self.source_sketches) > 1:
             from EasyDesignRegions import combined_profile
             profile = combined_profile(self.source_sketches)
-            relative = self.source_body.getGlobalPlacement().inverse().multiply(self.source_sketch.getGlobalPlacement())
+            relative = self.source_sketch.getGlobalPlacement()
             profile.transformShape(relative.toMatrix(), True)
             return profile.extrude(relative.Rotation.multVec(App.Vector(0, 0, distance)))
         if self.region_point is not None:
@@ -159,16 +172,45 @@ class PullPreview:
             wires = Part.makeCompound(edges).makeWires("").Wires
             profile = Part.makeFace(wires, "Part::FaceMakerBullseye")
         direction = self.source_sketch.Placement.Rotation.multVec(App.Vector(0, 0, distance))
-        return profile.extrude(direction)
+        tool = profile.extrude(direction)
+        parent = self.source_sketch.getGlobalPlacement().multiply(self.source_sketch.Placement.inverse())
+        tool.transformShape(parent.toMatrix(), True)
+        return tool
+
+    def _target(self, distance):
+        tool = self._tool(distance)
+        targets = list(self.candidates)
+        if self.native_solid and (not self.native_solid.ViewObject or mm._visible(self.source_body)):
+            targets.insert(0, self.native_solid)
+        # Follow an external face support before considering unrelated solids.
+        supports = [obj for obj, _ in self.source_sketch.AttachmentSupport]
+        for support in list(supports):
+            if "Support" in support.PropertiesList:
+                supports.extend(obj for obj, _ in support.Support)
+        preferred = [mm.solid_object(obj) for obj in supports]
+        targets.sort(key=lambda obj: mm.solid_object(obj) not in preferred)
+        for obj in targets:
+            base = mm._shape(obj)
+            if tool.distToShape(base)[0] < 1e-7:
+                if ((distance >= 0 and self.operation != "Subtract / Cut")
+                        or tool.common(base).Volume > 1e-7):
+                    return obj
+        return self.native_solid if self.native_solid in targets else None
 
     def _build(self, distance, force_new=False):
         new_solid = self.operation == "New Solid" or force_new
+        target = self._target(distance) if not new_solid else None
+        same_target = target == self.previous_solid
+        self.previous_solid = target
+        if self.operation == "Auto" and target is None and self.native_solid:
+            new_solid = True
         if self.operation == "Merge" and self.previous_solid is None:
             raise ValueError("Merge needs an existing solid. Choose Auto or New Solid.")
         if self.previous_solid and not new_solid and self.taper == 0:
             tool = self._tool(distance)
-            contact = tool.distToShape(self.previous_solid.Shape)[0] < 1e-7
-            overlap = tool.common(self.previous_solid.Shape).Volume > 1e-7
+            base = mm._shape(self.previous_solid)
+            contact = tool.distToShape(base)[0] < 1e-7
+            overlap = tool.common(base).Volume > 1e-7
             if self.operation == "Auto":
                 new_solid = not (overlap if distance < 0 else contact)
             elif self.operation == "Merge" and not contact:
@@ -179,7 +221,7 @@ class PullPreview:
                (self.operation == "Auto" and distance < 0 and self.previous_solid is not None and not new_solid))
         if cut and not self.previous_solid:
             raise ValueError("Subtract / Cut needs an existing solid.")
-        if self.feature and new_solid == self.new_solid and cut == self.cut:
+        if self.feature and same_target and new_solid == self.new_solid and cut == self.cut:
             self.feature.Length = abs(distance)
             self.feature.Reversed = distance > 0 if cut else distance < 0
             self.doc.recompute()
@@ -197,6 +239,25 @@ class PullPreview:
         self.new_solid = new_solid
         if self.new_solid and not self.standalone_body:
             self.body = self.doc.addObject("PartDesign::Body", "ExtrudedBody")
+        if not self.new_solid and self.previous_solid and self.previous_solid != self.native_solid:
+            self.body = self.doc.addObject("PartDesign::Body", "ExtrudedBody")
+            base = (self.previous_solid.Tip if self.previous_solid.isDerivedFrom("PartDesign::Body")
+                    else self.previous_solid)
+            root, path = mm._reference(base)
+            if path:
+                # Native BaseFeature links see local coordinates. Resolve the
+                # full group path in world coordinates before importing it.
+                self.reference = self.doc.addObject("PartDesign::SubShapeBinder", "ExtrusionReference")
+                self.reference.Support = [(root, [path])]
+                self.doc.recompute()
+                base = self.reference
+                if base.ViewObject:
+                    base.ViewObject.Visibility = False
+            self.body.BaseFeature = base
+            self.doc.recompute()
+            self.base_feature = self.body.Tip
+        else:
+            self.base_feature = self.previous_solid
         if len(self.source_sketches) > 1:
             from EasyDesignRegions import create_combined_profile
             self.sketch = create_combined_profile(self.body, self.source_sketches)
@@ -229,7 +290,7 @@ class PullPreview:
             self.feature.UseCustomVector = True
             self.feature.setExpression("Direction", ("-" if cut else "") + self.sketch.Name + ".ExtrusionNormal")
         if not self.new_solid and self.previous_solid:
-            self.feature.BaseFeature = self.previous_solid
+            self.feature.BaseFeature = self.base_feature
         self.feature.Length = abs(distance)
         self.feature.TaperAngle = self.taper
         self.feature.Reversed = distance > 0 if cut else distance < 0
@@ -249,7 +310,8 @@ class PullPreview:
                 raise ValueError("The extrusion does not change the existing solid. Choose New Solid or another depth.")
 
     def _inherit_appearance(self):
-        source, target = self.previous_solid.ViewObject, self.feature.ViewObject
+        original = self.previous_solid.Tip if self.previous_solid.isDerivedFrom("PartDesign::Body") else self.previous_solid
+        source, target = original.ViewObject, self.feature.ViewObject
         if not source or not target:
             return
         for name in ("ShapeMaterial", "ShapeColor", "LineColor", "Transparency", "DisplayMode"):

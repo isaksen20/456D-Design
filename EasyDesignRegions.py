@@ -59,6 +59,10 @@ class RegionProfile:
     """Keep a selected planar region linked to its editable source sketch."""
 
     def onDocumentRestored(self, obj):
+        if "SourceSketch" in obj.PropertiesList and obj.SourceSketch is None:
+            obj.touch()
+        if "SourceSketches" in obj.PropertiesList and len(obj.SourceSketches) < 2:
+            obj.touch()
         if not obj.ViewObject or obj.ViewObject.Proxy is not None:
             return
         # Older files had no view proxy: their internal face was shown on load,
@@ -72,6 +76,11 @@ class RegionProfile:
 
     def execute(self, obj):
         sketch = obj.SourceSketch
+        if sketch is None:
+            if obj.Shape.isNull() or not obj.Shape.Faces or not obj.Shape.isValid():
+                raise ValueError("The source sketch is missing and no saved extrusion outline is available.")
+            self._status(obj, "Frozen - source sketch removed")
+            return
         edges = list(obj.ProfileEdges) if "ProfileEdges" in obj.PropertiesList else []
         if edges:
             wires = Part.makeCompound([sketch.Shape.getElement(name) for name in edges]).makeWires("").Wires
@@ -96,6 +105,16 @@ class RegionProfile:
         obj.Placement = body.getGlobalPlacement().inverse().multiply(sketch.getGlobalPlacement())
         if "ExtrusionNormal" in obj.PropertiesList:
             obj.ExtrusionNormal = obj.Placement.Rotation.multVec(App.Vector(0, 0, 1))
+        self._status(obj, "Linked")
+
+    def _status(self, obj, value):
+        if "SourceStatus" not in obj.PropertiesList:
+            obj.addProperty("App::PropertyString", "SourceStatus", "456D Design")
+            obj.setEditorMode("SourceStatus", 1)
+        if obj.SourceStatus != value:
+            obj.SourceStatus = value
+            if value.startswith("Frozen"):
+                App.Console.PrintWarning("456D Design: %s retains its saved outline because its source sketch was removed.\n" % obj.Label)
 
     def dumps(self):
         return None
@@ -107,12 +126,18 @@ class RegionProfile:
 class CombinedProfile(RegionProfile):
     def execute(self, obj):
         sketches = list(obj.SourceSketches)
+        if len(sketches) < 2 or any(sketch is None for sketch in sketches):
+            if obj.Shape.isNull() or not obj.Shape.Faces or not obj.Shape.isValid():
+                raise ValueError("A source sketch is missing and no combined extrusion outline is available.")
+            self._status(obj, "Frozen - source sketch removed")
+            return
         shape = combined_profile(sketches)
         body = obj.getParentGeoFeatureGroup()
         obj.Placement = App.Placement()
         obj.Shape = shape
         obj.Placement = body.getGlobalPlacement().inverse().multiply(sketches[0].getGlobalPlacement())
         obj.ExtrusionNormal = obj.Placement.Rotation.multVec(App.Vector(0, 0, 1))
+        self._status(obj, "Linked")
 
 
 def create_combined_profile(body, sketches):
